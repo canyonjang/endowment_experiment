@@ -50,8 +50,14 @@ if is_admin:
                 supabase.table('students').update({"bid_price": 0}).neq('name', '').execute()
             st.rerun()
 
-        if st.sidebar.button("💡 거래 매칭 실행"):
-            # (매칭 로직은 이전과 동일)
+        # [개선] 거래 매칭 실행 (중복 방지 로직 추가)
+        st.divider()
+        st.subheader("💡 거래 매칭 실행")
+        if st.button("실시간 거래 성사 (매칭 실행)"):
+            # 1. 기존 해당 라운드 거래 내역 삭제 (중복 누적 방지)
+            supabase.table('trades').delete().eq('round_num', curr_round).execute()
+            
+            # 2. 학생 데이터 가져오기 및 분류
             all_students = supabase.table('students').select("*").execute().data
             sellers, buyers = [], []
             for s in all_students:
@@ -60,27 +66,40 @@ if is_admin:
                 if role == "seller" and s['bid_price'] > 0: sellers.append(s)
                 elif role == "buyer" and s['bid_price'] > 0: buyers.append(s)
             
+            # 3. 매칭 알고리즘 (판매자 낮은가격순, 구매자 높은가격순)
             sellers.sort(key=lambda x: x['bid_price'])
             buyers.sort(key=lambda x: x['bid_price'], reverse=True)
             
             for s_idx in range(min(len(sellers), len(buyers))):
                 if buyers[s_idx]['bid_price'] >= sellers[s_idx]['bid_price']:
-                    supabase.table('trades').insert({"round_num": curr_round, "price": sellers[s_idx]['bid_price'], "seller_name": sellers[s_idx]['name'], "buyer_name": buyers[s_idx]['name']}).execute()
+                    supabase.table('trades').insert({
+                        "round_num": curr_round, 
+                        "price": sellers[s_idx]['bid_price'], 
+                        "seller_name": sellers[s_idx]['name'], 
+                        "buyer_name": buyers[s_idx]['name']
+                    }).execute()
             
+            # 4. 상태를 결과발표로 변경
             supabase.table('experiment_sessions').update({"status": "result"}).eq('id', session['id']).execute()
+            st.success(f"{curr_round}라운드 매칭이 완료되었습니다. (중복 내역 정정 완료)")
             st.rerun()
 
-        # 라운드별 거래 요약 (중앙 화면)
+        # 라운드별 거래 요약 차트
         st.divider()
         st.subheader("🏁 라운드별 거래 요약")
-        all_trades = pd.DataFrame(supabase.table('trades').select("*").execute().data)
+        all_trades_raw = supabase.table('trades').select("*").execute().data
+        all_trades = pd.DataFrame(all_trades_raw)
         
         if not all_trades.empty:
             summary = all_trades.groupby('round_num').size().reset_index(name='거래 건수')
+            # 1~4라운드 모두 표시하기 위해 병합
+            full_rounds = pd.DataFrame({'round_num': [1, 2, 3, 4]})
+            summary = pd.merge(full_rounds, summary, on='round_num', how='left').fillna(0)
             summary['이론적 예상'] = 10 
+            
             cols = st.columns(4)
             for i in range(1, 5):
-                count = summary[summary['round_num'] == i]['거래 건수'].values[0] if i in summary['round_num'].values else 0
+                count = int(summary[summary['round_num'] == i]['거래 건수'].values[0])
                 cols[i-1].metric(f"{i}라운드", f"{count}건")
             st.bar_chart(summary.set_index('round_num')[['거래 건수', '이론적 예상']])
         else:
@@ -91,10 +110,10 @@ if is_admin:
             st.divider()
             st.header("🎊 실험 최종 결과 분석")
             st.balloons()
-            avg_prices = all_trades.groupby('round_num')['price'].mean().reset_index(name='평균 가격')
-            st.subheader("💰 라운드별 평균 체결 가격 변화")
-            st.line_chart(avg_prices.set_index('round_num'))
-            st.write("💡 **교수님 가이드:** 역할이 반전된 4라운드에서 가격과 거래량이 어떻게 변했는지 학생들과 토론해 보세요.")
+            if not all_trades.empty:
+                avg_prices = all_trades.groupby('round_num')['price'].mean().reset_index(name='평균 가격')
+                st.subheader("💰 라운드별 평균 체결 가격 변화")
+                st.line_chart(avg_prices.set_index('round_num'))
 
         # 입력 현황 모니터링 (수동)
         st.divider()
@@ -108,7 +127,7 @@ if is_admin:
     st.stop()
 
 # ==========================================
-# 🎓 학생용 실험 화면 (시장 통계 제거 & 자산 정산 연출)
+# 🎓 학생용 실험 화면
 # ==========================================
 st.title("🥤 행동재무학 실험: 스벅 아아 소유효과")
 
@@ -128,28 +147,26 @@ if st.button("🔄 화면 새로고침"):
 
 user_data = supabase.table('students').select("*").eq('name', user_name).execute().data[0]
 
-# 역할 계산
+# 역할 및 소유권 계산
 if curr_round == 4:
     display_role, display_has_badge = ("buyer", not user_data['has_badge']) if user_data['role'] == "seller" else ("seller", not user_data['has_badge'])
 else:
     display_role, display_has_badge = user_data['role'], user_data['has_badge']
 
-# --- [고도화] 결과 화면 자산 및 정산 금액 연출 로직 (UI 전용) ---
+# 결과 화면 정산 연출 로직
 final_has_badge, my_trade = display_has_badge, None
-display_cash = 10000 # 초기 기본 현금
+display_cash = 10000 
 
 if status == 'result':
     trade_q = supabase.table('trades').select("*").eq('round_num', curr_round).or_(f"seller_name.eq.{user_name},buyer_name.eq.{user_name}").execute().data
     if trade_q:
         my_trade = trade_q[0]
-        # 내가 판매자였는데 성공했다면
         if user_name == my_trade['seller_name']:
             final_has_badge = False
-            display_cash = 10000 + my_trade['price'] # 정산 금액 합산
-        # 내가 구매자였는데 성공했다면
+            display_cash = 10000 + my_trade['price']
         else:
             final_has_badge = True
-            display_cash = 10000 - my_trade['price'] # 정산 금액 차감
+            display_cash = 10000 - my_trade['price']
 
 st.info(f"📍 {user_name}님, [ 제 {curr_round} 라운드 ] 진행 중")
 
@@ -157,11 +174,8 @@ col1, col2 = st.columns([1, 1.5])
 with col1:
     st.subheader("나의 자산")
     if final_has_badge:
-        st.image("starbucks_badge.png", width=180) # 파일명 확인 필수
+        st.image("starbucks_badge.png", width=180)
         st.success("보유 중: 스벅 아아 배지")
-    
-    # [개선] 매도/매수 성공 여부와 상관없이 항상 정산된 현금을 보여줍니다.
-    # 성공한 구매자에게는 배지와 줄어든 현금이, 성공한 판매자에게는 배지 없이 늘어난 현금이 나타납니다.
     st.metric(label="보유 현금", value=f"{display_cash:,}원")
 
 with col2:
@@ -183,4 +197,3 @@ if status == 'result':
         st.write(f"🤝 거래 상대방: **{my_trade['seller_name'] if user_name == my_trade['buyer_name'] else my_trade['buyer_name']}**님")
     elif user_data['bid_price'] > 0:
         st.error("### 📉 거래 실패 (가격 불일치)")
-    # 학생 화면에서 전체 거래 건수 통계는 제거되었습니다.
