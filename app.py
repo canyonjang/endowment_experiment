@@ -56,8 +56,7 @@ col1, col2 = st.columns([1, 1.5])
 with col1:
     st.subheader("나의 자산")
     if display_has_badge:
-        # 배지 이미지는 아까 만드신 것을 URL로 넣으시면 됩니다.
-        st.image("https://your-image-url.com/starbucks_badge.png", width=180)
+        st.image("starbucks_badge.png", width=180)
         st.success("소유 중: 스벅 아아")
     else:
         st.metric(label="보유 가상 현금", value="10,000원")
